@@ -1,13 +1,21 @@
-[log]
-logLevel = "DEBUG"
+[global]
+  checkNewVersion = false
+  sendAnonymousUsage = false
 
-[api]
+[log]
+  level = "DEBUG"
 
 [entryPoints]
-  [entryPoints.http]
-  address = ":8000"
+  [entryPoints.web]
+    address = ":8000"
+
+[api]
+  insecure = true
 
 [providers]
-   [providers.consulCatalog]
-      domain = "consul.localhost"
-      frontEndRule = "Host:{{.ServiceName}}.{{.Domain}}"
+  [providers.consulCatalog]
+    exposedByDefault = true
+    refreshInterval = "500ms"
+    defaultRule = "{{ .DefaultRule }}"
+  [providers.consulCatalog.endpoint]
+    address = "{{ .ConsulAddress }}"

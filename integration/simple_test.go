@@ -1,20 +1,26 @@
 package integration
 
 import (
+	"bytes"
+	"crypto/rand"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/containous/traefik/integration/try"
+	"github.com/containous/traefik/v2/integration/try"
+	"github.com/containous/traefik/v2/pkg/config/dynamic"
 	"github.com/go-check/check"
 	checker "github.com/vdemeester/shakers"
 )
 
-// SimpleSuite
+// SimpleSuite tests suite.
 type SimpleSuite struct{ BaseSuite }
 
 func (s *SimpleSuite) TestInvalidConfigShouldFail(c *check.C) {
@@ -57,7 +63,7 @@ func (s *SimpleSuite) TestWithWebConfig(c *check.C) {
 	c.Assert(err, checker.IsNil)
 	defer cmd.Process.Kill()
 
-	err = try.GetRequest("http://127.0.0.1:8080/api/providers", 1*time.Second, try.StatusCodeIs(http.StatusOK))
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 1*time.Second, try.StatusCodeIs(http.StatusOK))
 	c.Assert(err, checker.IsNil)
 }
 
@@ -95,6 +101,7 @@ func (s *SimpleSuite) TestRequestAcceptGraceTimeout(c *check.C) {
 		Server string
 	}{whoami})
 	defer os.Remove(file)
+
 	cmd, display := s.traefikCmd(withConfigFile(file))
 	defer display(c)
 	err := cmd.Start()
@@ -154,37 +161,8 @@ func (s *SimpleSuite) TestRequestAcceptGraceTimeout(c *check.C) {
 	}
 }
 
-func (s *SimpleSuite) TestApiOnSameEntryPoint(c *check.C) {
-	c.Skip("Use docker")
-
-	s.createComposeProject(c, "base")
-	s.composeProject.Start(c)
-
-	cmd, output := s.traefikCmd("--entryPoints=Name:http Address::8000", "--api.entryPoint=http", "--global.debug", "--providers.docker")
-	defer output(c)
-
-	err := cmd.Start()
-	c.Assert(err, checker.IsNil)
-	defer cmd.Process.Kill()
-
-	// TODO validate : run on 80
-	// Expected a 404 as we did not configure anything
-	err = try.GetRequest("http://127.0.0.1:8000/test", 1*time.Second, try.StatusCodeIs(http.StatusNotFound))
-	c.Assert(err, checker.IsNil)
-
-	err = try.GetRequest("http://127.0.0.1:8000/api", 1*time.Second, try.StatusCodeIs(http.StatusOK))
-	c.Assert(err, checker.IsNil)
-
-	err = try.GetRequest("http://127.0.0.1:8000/api/providers/file/routers", 1*time.Second, try.BodyContains("PathPrefix"))
-	c.Assert(err, checker.IsNil)
-
-	err = try.GetRequest("http://127.0.0.1:8000/whoami", 1*time.Second, try.StatusCodeIs(http.StatusOK))
-	c.Assert(err, checker.IsNil)
-}
-
 func (s *SimpleSuite) TestStatsWithMultipleEntryPoint(c *check.C) {
-	c.Skip("Use docker")
-
+	c.Skip("Stats is missing")
 	s.createComposeProject(c, "stats")
 	s.composeProject.Start(c)
 
@@ -205,7 +183,7 @@ func (s *SimpleSuite) TestStatsWithMultipleEntryPoint(c *check.C) {
 	err = try.GetRequest("http://127.0.0.1:8080/api", 1*time.Second, try.StatusCodeIs(http.StatusOK))
 	c.Assert(err, checker.IsNil)
 
-	err = try.GetRequest("http://127.0.0.1:8080/api/providers/file/routers", 1*time.Second, try.BodyContains("PathPrefix"))
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 1*time.Second, try.BodyContains("PathPrefix"))
 	c.Assert(err, checker.IsNil)
 
 	err = try.GetRequest("http://127.0.0.1:8000/whoami", 1*time.Second, try.StatusCodeIs(http.StatusOK))
@@ -216,82 +194,78 @@ func (s *SimpleSuite) TestStatsWithMultipleEntryPoint(c *check.C) {
 
 	err = try.GetRequest("http://127.0.0.1:8080/health", 1*time.Second, try.BodyContains(`"total_status_code_count":{"200":2}`))
 	c.Assert(err, checker.IsNil)
-
 }
 
 func (s *SimpleSuite) TestNoAuthOnPing(c *check.C) {
-	c.Skip("Middlewares on entryPoint don't work anymore")
+	c.Skip("Waiting for new api handler implementation")
+
 	s.createComposeProject(c, "base")
 	s.composeProject.Start(c)
 
-	cmd, output := s.traefikCmd(withConfigFile("./fixtures/simple_auth.toml"))
+	file := s.adaptFile(c, "./fixtures/simple_auth.toml", struct{}{})
+	defer os.Remove(file)
+	cmd, output := s.traefikCmd(withConfigFile(file))
 	defer output(c)
 
 	err := cmd.Start()
 	c.Assert(err, checker.IsNil)
 	defer cmd.Process.Kill()
 
-	err = try.GetRequest("http://127.0.0.1:8001/api", 1*time.Second, try.StatusCodeIs(http.StatusUnauthorized))
+	err = try.GetRequest("http://127.0.0.1:8001/api/rawdata", 2*time.Second, try.StatusCodeIs(http.StatusUnauthorized))
 	c.Assert(err, checker.IsNil)
 
 	err = try.GetRequest("http://127.0.0.1:8001/ping", 1*time.Second, try.StatusCodeIs(http.StatusOK))
 	c.Assert(err, checker.IsNil)
 }
 
-func (s *SimpleSuite) TestDefaultEntrypointHTTP(c *check.C) {
-	c.Skip("Use docker")
-
+func (s *SimpleSuite) TestDefaultEntryPointHTTP(c *check.C) {
 	s.createComposeProject(c, "base")
 	s.composeProject.Start(c)
 
-	cmd, output := s.traefikCmd("--entryPoints=Name:http Address::8000", "--global.debug", "--providers.docker", "--api")
+	cmd, output := s.traefikCmd("--entryPoints.http.Address=:8000", "--log.level=DEBUG", "--providers.docker", "--api.insecure")
 	defer output(c)
 
 	err := cmd.Start()
 	c.Assert(err, checker.IsNil)
 	defer cmd.Process.Kill()
 
-	err = try.GetRequest("http://127.0.0.1:8080/api/providers/file/routers", 1*time.Second, try.BodyContains("PathPrefix"))
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 1*time.Second, try.BodyContains("PathPrefix"))
 	c.Assert(err, checker.IsNil)
 
 	err = try.GetRequest("http://127.0.0.1:8000/whoami", 1*time.Second, try.StatusCodeIs(http.StatusOK))
 	c.Assert(err, checker.IsNil)
 }
 
-func (s *SimpleSuite) TestWithUnexistingEntrypoint(c *check.C) {
-	c.Skip("Use docker")
-
+func (s *SimpleSuite) TestWithNonExistingEntryPoint(c *check.C) {
 	s.createComposeProject(c, "base")
 	s.composeProject.Start(c)
 
-	cmd, output := s.traefikCmd("--entryPoints=Name:http Address::8000", "--global.debug", "--providers.docker", "--api")
+	cmd, output := s.traefikCmd("--entryPoints.http.Address=:8000", "--log.level=DEBUG", "--providers.docker", "--api.insecure")
 	defer output(c)
 
 	err := cmd.Start()
 	c.Assert(err, checker.IsNil)
 	defer cmd.Process.Kill()
 
-	err = try.GetRequest("http://127.0.0.1:8080/api/providers/file/routers", 1*time.Second, try.BodyContains("PathPrefix"))
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 1*time.Second, try.BodyContains("PathPrefix"))
 	c.Assert(err, checker.IsNil)
 
 	err = try.GetRequest("http://127.0.0.1:8000/whoami", 1*time.Second, try.StatusCodeIs(http.StatusOK))
 	c.Assert(err, checker.IsNil)
 }
 
-func (s *SimpleSuite) TestMetricsPrometheusDefaultEntrypoint(c *check.C) {
-	c.Skip("Use docker")
-
+func (s *SimpleSuite) TestMetricsPrometheusDefaultEntryPoint(c *check.C) {
 	s.createComposeProject(c, "base")
 	s.composeProject.Start(c)
 
-	cmd, output := s.traefikCmd("--entryPoints=Name:http Address::8000", "--api", "--metrics.prometheus.buckets=0.1,0.3,1.2,5.0", "--docker", "--global.debug")
+	cmd, output := s.traefikCmd("--entryPoints.http.Address=:8000", "--api.insecure", "--metrics.prometheus.buckets=0.1,0.3,1.2,5.0", "--providers.docker", "--log.level=DEBUG")
 	defer output(c)
 
 	err := cmd.Start()
 	c.Assert(err, checker.IsNil)
 	defer cmd.Process.Kill()
 
-	err = try.GetRequest("http://127.0.0.1:8080/api/providers/file/routers", 1*time.Second, try.BodyContains("PathPrefix"))
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 1*time.Second, try.BodyContains("PathPrefix"))
 	c.Assert(err, checker.IsNil)
 
 	err = try.GetRequest("http://127.0.0.1:8000/whoami", 1*time.Second, try.StatusCodeIs(http.StatusOK))
@@ -302,8 +276,6 @@ func (s *SimpleSuite) TestMetricsPrometheusDefaultEntrypoint(c *check.C) {
 }
 
 func (s *SimpleSuite) TestMultipleProviderSameBackendName(c *check.C) {
-	c.Skip("Use docker")
-
 	s.createComposeProject(c, "base")
 	s.composeProject.Start(c)
 
@@ -321,7 +293,7 @@ func (s *SimpleSuite) TestMultipleProviderSameBackendName(c *check.C) {
 	c.Assert(err, checker.IsNil)
 	defer cmd.Process.Kill()
 
-	err = try.GetRequest("http://127.0.0.1:8080/api/providers/file/routers", 1*time.Second, try.BodyContains("PathPrefix"))
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 1*time.Second, try.BodyContains("PathPrefix"))
 	c.Assert(err, checker.IsNil)
 
 	err = try.GetRequest("http://127.0.0.1:8000/whoami", 1*time.Second, try.BodyContains(ipWhoami01))
@@ -329,12 +301,9 @@ func (s *SimpleSuite) TestMultipleProviderSameBackendName(c *check.C) {
 
 	err = try.GetRequest("http://127.0.0.1:8000/file", 1*time.Second, try.BodyContains(ipWhoami02))
 	c.Assert(err, checker.IsNil)
-
 }
 
 func (s *SimpleSuite) TestIPStrategyWhitelist(c *check.C) {
-	c.Skip("Use docker")
-
 	s.createComposeProject(c, "whitelist")
 	s.composeProject.Start(c)
 
@@ -345,7 +314,10 @@ func (s *SimpleSuite) TestIPStrategyWhitelist(c *check.C) {
 	c.Assert(err, checker.IsNil)
 	defer cmd.Process.Kill()
 
-	err = try.GetRequest("http://127.0.0.1:8080/api/providers/file/routers", 1*time.Second, try.BodyContains("override"))
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 2*time.Second, try.BodyContains("override"))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 2*time.Second, try.BodyContains("override.remoteaddr.whitelist.docker.local"))
 	c.Assert(err, checker.IsNil)
 
 	testCases := []struct {
@@ -354,18 +326,6 @@ func (s *SimpleSuite) TestIPStrategyWhitelist(c *check.C) {
 		host               string
 		expectedStatusCode int
 	}{
-		{
-			desc:               "default client ip strategy accept",
-			xForwardedFor:      "8.8.8.8,127.0.0.1",
-			host:               "no.override.whitelist.docker.local",
-			expectedStatusCode: 200,
-		},
-		{
-			desc:               "default client ip strategy reject",
-			xForwardedFor:      "8.8.8.10,127.0.0.1",
-			host:               "no.override.whitelist.docker.local",
-			expectedStatusCode: 403,
-		},
 		{
 			desc:               "override remote addr reject",
 			xForwardedFor:      "8.8.8.8,8.8.8.8",
@@ -411,10 +371,43 @@ func (s *SimpleSuite) TestIPStrategyWhitelist(c *check.C) {
 	}
 }
 
-func (s *SimpleSuite) TestKeepTrailingSlash(c *check.C) {
-	file := s.adaptFile(c, "fixtures/keep_trailing_slash.toml", struct {
-		KeepTrailingSlash bool
-	}{true})
+func (s *SimpleSuite) TestXForwardedHeaders(c *check.C) {
+	s.createComposeProject(c, "whitelist")
+	s.composeProject.Start(c)
+
+	cmd, output := s.traefikCmd(withConfigFile("fixtures/simple_whitelist.toml"))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 2*time.Second,
+		try.BodyContains("override.remoteaddr.whitelist.docker.local"))
+	c.Assert(err, checker.IsNil)
+
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000", nil)
+	c.Assert(err, checker.IsNil)
+
+	req.Host = "override.depth.whitelist.docker.local"
+	req.Header.Set("X-Forwarded-For", "8.8.8.8,10.0.0.1,127.0.0.1")
+
+	err = try.Request(req, 1*time.Second,
+		try.StatusCodeIs(http.StatusOK),
+		try.BodyContains("X-Forwarded-Proto", "X-Forwarded-For", "X-Forwarded-Host",
+			"X-Forwarded-Host", "X-Forwarded-Port", "X-Forwarded-Server", "X-Real-Ip"))
+	c.Assert(err, checker.IsNil)
+}
+
+func (s *SimpleSuite) TestMultiProvider(c *check.C) {
+	s.createComposeProject(c, "base")
+	s.composeProject.Start(c)
+
+	server := "http://" + s.composeProject.Container(c, "whoami1").NetworkSettings.IPAddress
+
+	file := s.adaptFile(c, "fixtures/multiprovider.toml", struct {
+		Server string
+	}{Server: server})
 	defer os.Remove(file)
 
 	cmd, output := s.traefikCmd(withConfigFile(file))
@@ -424,13 +417,661 @@ func (s *SimpleSuite) TestKeepTrailingSlash(c *check.C) {
 	c.Assert(err, checker.IsNil)
 	defer cmd.Process.Kill()
 
-	oldCheckRedirect := http.DefaultClient.CheckRedirect
-	http.DefaultClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-
-	err = try.GetRequest("http://127.0.0.1:8000/test/foo/", 1*time.Second, try.StatusCodeIs(http.StatusNotFound))
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 1000*time.Millisecond, try.BodyContains("service"))
 	c.Assert(err, checker.IsNil)
 
-	http.DefaultClient.CheckRedirect = oldCheckRedirect
+	config := dynamic.Configuration{
+		HTTP: &dynamic.HTTPConfiguration{
+			Routers: map[string]*dynamic.Router{
+				"router1": {
+					EntryPoints: []string{"web"},
+					Middlewares: []string{"customheader@file"},
+					Service:     "service@file",
+					Rule:        "PathPrefix(`/`)",
+				},
+			},
+		},
+	}
+
+	jsonContent, err := json.Marshal(config)
+	c.Assert(err, checker.IsNil)
+
+	request, err := http.NewRequest(http.MethodPut, "http://127.0.0.1:8080/api/providers/rest", bytes.NewReader(jsonContent))
+	c.Assert(err, checker.IsNil)
+
+	response, err := http.DefaultClient.Do(request)
+	c.Assert(err, checker.IsNil)
+	c.Assert(response.StatusCode, checker.Equals, http.StatusOK)
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 1000*time.Millisecond, try.BodyContains("PathPrefix(`/`)"))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/", 1*time.Second, try.StatusCodeIs(http.StatusOK), try.BodyContains("CustomValue"))
+	c.Assert(err, checker.IsNil)
+}
+
+func (s *SimpleSuite) TestSimpleConfigurationHostRequestTrailingPeriod(c *check.C) {
+	s.createComposeProject(c, "base")
+	s.composeProject.Start(c)
+
+	server := "http://" + s.composeProject.Container(c, "whoami1").NetworkSettings.IPAddress
+
+	file := s.adaptFile(c, "fixtures/file/simple-hosts.toml", struct {
+		Server string
+	}{Server: server})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	testCases := []struct {
+		desc        string
+		requestHost string
+	}{
+		{
+			desc:        "Request host without trailing period, rule without trailing period",
+			requestHost: "test.localhost",
+		},
+		{
+			desc:        "Request host with trailing period, rule without trailing period",
+			requestHost: "test.localhost.",
+		},
+		{
+			desc:        "Request host without trailing period, rule with trailing period",
+			requestHost: "test.foo.localhost",
+		},
+		{
+			desc:        "Request host with trailing period, rule with trailing period",
+			requestHost: "test.foo.localhost.",
+		},
+	}
+
+	for _, test := range testCases {
+		req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000", nil)
+		c.Assert(err, checker.IsNil)
+		req.Host = test.requestHost
+		err = try.Request(req, 1*time.Second, try.StatusCodeIs(http.StatusOK))
+		if err != nil {
+			c.Fatalf("Error while testing %s: %v", test.desc, err)
+		}
+	}
+}
+
+func (s *SimpleSuite) TestRouterConfigErrors(c *check.C) {
+	file := s.adaptFile(c, "fixtures/router_errors.toml", struct{}{})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	// All errors
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/routers", 1000*time.Millisecond, try.BodyContains(`["middleware \"unknown@file\" does not exist","found different TLS options for routers on the same host snitest.net, so using the default TLS options instead"]`))
+	c.Assert(err, checker.IsNil)
+
+	// router3 has an error because it uses an unknown entrypoint
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/routers/router3@file", 1000*time.Millisecond, try.BodyContains(`entryPoint \"unknown-entrypoint\" doesn't exist`, "no valid entryPoint for this router"))
+	c.Assert(err, checker.IsNil)
+
+	// router4 is enabled, but in warning state because its tls options conf was messed up
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/routers/router4@file", 1000*time.Millisecond, try.BodyContains(`"status":"warning"`))
+	c.Assert(err, checker.IsNil)
+
+	// router5 is disabled because its middleware conf is broken
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/routers/router5@file", 1000*time.Millisecond, try.BodyContains())
+	c.Assert(err, checker.IsNil)
+}
+
+func (s *SimpleSuite) TestServiceConfigErrors(c *check.C) {
+	file := s.adaptFile(c, "fixtures/service_errors.toml", struct{}{})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/services", 1000*time.Millisecond, try.BodyContains(`["the service \"service1@file\" does not have any type defined"]`))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/services/service1@file", 1000*time.Millisecond, try.BodyContains(`"status":"disabled"`))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/services/service2@file", 1000*time.Millisecond, try.BodyContains(`"status":"enabled"`))
+	c.Assert(err, checker.IsNil)
+}
+
+func (s *SimpleSuite) TestTCPRouterConfigErrors(c *check.C) {
+	file := s.adaptFile(c, "fixtures/router_errors.toml", struct{}{})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	// router3 has an error because it uses an unknown entrypoint
+	err = try.GetRequest("http://127.0.0.1:8080/api/tcp/routers/router3@file", 1000*time.Millisecond, try.BodyContains(`entryPoint \"unknown-entrypoint\" doesn't exist`, "no valid entryPoint for this router"))
+	c.Assert(err, checker.IsNil)
+
+	// router4 has an unsupported Rule
+	err = try.GetRequest("http://127.0.0.1:8080/api/tcp/routers/router4@file", 1000*time.Millisecond, try.BodyContains("unknown rule Host(`mydomain.com`)"))
+	c.Assert(err, checker.IsNil)
+}
+
+func (s *SimpleSuite) TestTCPServiceConfigErrors(c *check.C) {
+	file := s.adaptFile(c, "fixtures/tcp/service_errors.toml", struct{}{})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/tcp/services", 1000*time.Millisecond, try.BodyContains(`["the service \"service1@file\" does not have any type defined"]`))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/tcp/services/service1@file", 1000*time.Millisecond, try.BodyContains(`"status":"disabled"`))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/tcp/services/service2@file", 1000*time.Millisecond, try.BodyContains(`"status":"enabled"`))
+	c.Assert(err, checker.IsNil)
+}
+
+func (s *SimpleSuite) TestUDPRouterConfigErrors(c *check.C) {
+	file := s.adaptFile(c, "fixtures/router_errors.toml", struct{}{})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/udp/routers/router3@file", 1000*time.Millisecond, try.BodyContains(`entryPoint \"unknown-entrypoint\" doesn't exist`, "no valid entryPoint for this router"))
+	c.Assert(err, checker.IsNil)
+}
+
+func (s *SimpleSuite) TestUDPServiceConfigErrors(c *check.C) {
+	file := s.adaptFile(c, "fixtures/udp/service_errors.toml", struct{}{})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/udp/services", 1000*time.Millisecond, try.BodyContains(`["the udp service \"service1@file\" does not have any type defined"]`))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/udp/services/service1@file", 1000*time.Millisecond, try.BodyContains(`"status":"disabled"`))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/udp/services/service2@file", 1000*time.Millisecond, try.BodyContains(`"status":"enabled"`))
+	c.Assert(err, checker.IsNil)
+}
+
+func (s *SimpleSuite) TestWRR(c *check.C) {
+	s.createComposeProject(c, "base")
+	s.composeProject.Start(c)
+
+	server1 := s.composeProject.Container(c, "whoami1").NetworkSettings.IPAddress
+	server2 := s.composeProject.Container(c, "whoami2").NetworkSettings.IPAddress
+
+	file := s.adaptFile(c, "fixtures/wrr.toml", struct {
+		Server1 string
+		Server2 string
+	}{Server1: "http://" + server1, Server2: "http://" + server2})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/services", 1000*time.Millisecond, try.BodyContains("service1", "service2"))
+	c.Assert(err, checker.IsNil)
+
+	repartition := map[string]int{}
+	for i := 0; i < 4; i++ {
+		req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/whoami", nil)
+		c.Assert(err, checker.IsNil)
+
+		response, err := http.DefaultClient.Do(req)
+		c.Assert(err, checker.IsNil)
+		c.Assert(response.StatusCode, checker.Equals, http.StatusOK)
+
+		body, err := ioutil.ReadAll(response.Body)
+		c.Assert(err, checker.IsNil)
+
+		if strings.Contains(string(body), server1) {
+			repartition[server1]++
+		}
+		if strings.Contains(string(body), server2) {
+			repartition[server2]++
+		}
+	}
+
+	c.Assert(repartition[server1], checker.Equals, 3)
+	c.Assert(repartition[server2], checker.Equals, 1)
+}
+
+func (s *SimpleSuite) TestWRRSticky(c *check.C) {
+	s.createComposeProject(c, "base")
+	s.composeProject.Start(c)
+
+	server1 := s.composeProject.Container(c, "whoami1").NetworkSettings.IPAddress
+	server2 := s.composeProject.Container(c, "whoami2").NetworkSettings.IPAddress
+
+	file := s.adaptFile(c, "fixtures/wrr_sticky.toml", struct {
+		Server1 string
+		Server2 string
+	}{Server1: "http://" + server1, Server2: "http://" + server2})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/services", 1000*time.Millisecond, try.BodyContains("service1", "service2"))
+	c.Assert(err, checker.IsNil)
+
+	repartition := map[string]int{}
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/whoami", nil)
+	c.Assert(err, checker.IsNil)
+
+	for i := 0; i < 4; i++ {
+		response, err := http.DefaultClient.Do(req)
+		c.Assert(err, checker.IsNil)
+		c.Assert(response.StatusCode, checker.Equals, http.StatusOK)
+
+		for _, cookie := range response.Cookies() {
+			req.AddCookie(cookie)
+		}
+
+		body, err := ioutil.ReadAll(response.Body)
+		c.Assert(err, checker.IsNil)
+
+		if strings.Contains(string(body), server1) {
+			repartition[server1]++
+		}
+		if strings.Contains(string(body), server2) {
+			repartition[server2]++
+		}
+	}
+
+	c.Assert(repartition[server1], checker.Equals, 4)
+	c.Assert(repartition[server2], checker.Equals, 0)
+}
+
+func (s *SimpleSuite) TestMirror(c *check.C) {
+	var count, countMirror1, countMirror2 int32
+
+	main := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		atomic.AddInt32(&count, 1)
+	}))
+
+	mirror1 := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		atomic.AddInt32(&countMirror1, 1)
+	}))
+
+	mirror2 := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		atomic.AddInt32(&countMirror2, 1)
+	}))
+
+	mainServer := main.URL
+	mirror1Server := mirror1.URL
+	mirror2Server := mirror2.URL
+
+	file := s.adaptFile(c, "fixtures/mirror.toml", struct {
+		MainServer    string
+		Mirror1Server string
+		Mirror2Server string
+	}{MainServer: mainServer, Mirror1Server: mirror1Server, Mirror2Server: mirror2Server})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/services", 1000*time.Millisecond, try.BodyContains("mirror1", "mirror2", "service1"))
+	c.Assert(err, checker.IsNil)
+
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/whoami", nil)
+	c.Assert(err, checker.IsNil)
+	for i := 0; i < 10; i++ {
+		response, err := http.DefaultClient.Do(req)
+		c.Assert(err, checker.IsNil)
+		c.Assert(response.StatusCode, checker.Equals, http.StatusOK)
+	}
+
+	countTotal := atomic.LoadInt32(&count)
+	val1 := atomic.LoadInt32(&countMirror1)
+	val2 := atomic.LoadInt32(&countMirror2)
+
+	c.Assert(countTotal, checker.Equals, int32(10))
+	c.Assert(val1, checker.Equals, int32(1))
+	c.Assert(val2, checker.Equals, int32(5))
+}
+
+func (s *SimpleSuite) TestMirrorWithBody(c *check.C) {
+	var count, countMirror1, countMirror2 int32
+
+	body20 := make([]byte, 20)
+	_, err := rand.Read(body20)
+	c.Assert(err, checker.IsNil)
+
+	body5 := make([]byte, 5)
+	_, err = rand.Read(body5)
+	c.Assert(err, checker.IsNil)
+
+	verifyBody := func(req *http.Request) {
+		b, _ := ioutil.ReadAll(req.Body)
+		switch req.Header.Get("Size") {
+		case "20":
+			if !bytes.Equal(b, body20) {
+				c.Fatalf("Not Equals \n%v \n%v", body20, b)
+			}
+		case "5":
+			if !bytes.Equal(b, body5) {
+				c.Fatalf("Not Equals \n%v \n%v", body5, b)
+			}
+		default:
+			c.Fatal("Size header not present")
+		}
+	}
+
+	main := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		verifyBody(req)
+		atomic.AddInt32(&count, 1)
+	}))
+
+	mirror1 := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		verifyBody(req)
+		atomic.AddInt32(&countMirror1, 1)
+	}))
+
+	mirror2 := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		verifyBody(req)
+		atomic.AddInt32(&countMirror2, 1)
+	}))
+
+	mainServer := main.URL
+	mirror1Server := mirror1.URL
+	mirror2Server := mirror2.URL
+
+	file := s.adaptFile(c, "fixtures/mirror.toml", struct {
+		MainServer    string
+		Mirror1Server string
+		Mirror2Server string
+	}{MainServer: mainServer, Mirror1Server: mirror1Server, Mirror2Server: mirror2Server})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err = cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/services", 1000*time.Millisecond, try.BodyContains("mirror1", "mirror2", "service1"))
+	c.Assert(err, checker.IsNil)
+
+	req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/whoami", bytes.NewBuffer(body20))
+	c.Assert(err, checker.IsNil)
+	req.Header.Set("Size", "20")
+	for i := 0; i < 10; i++ {
+		response, err := http.DefaultClient.Do(req)
+		c.Assert(err, checker.IsNil)
+		c.Assert(response.StatusCode, checker.Equals, http.StatusOK)
+	}
+
+	countTotal := atomic.LoadInt32(&count)
+	val1 := atomic.LoadInt32(&countMirror1)
+	val2 := atomic.LoadInt32(&countMirror2)
+
+	c.Assert(countTotal, checker.Equals, int32(10))
+	c.Assert(val1, checker.Equals, int32(1))
+	c.Assert(val2, checker.Equals, int32(5))
+
+	atomic.StoreInt32(&count, 0)
+	atomic.StoreInt32(&countMirror1, 0)
+	atomic.StoreInt32(&countMirror2, 0)
+
+	req, err = http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/whoamiWithMaxBody", bytes.NewBuffer(body5))
+	req.Header.Set("Size", "5")
+	c.Assert(err, checker.IsNil)
+	for i := 0; i < 10; i++ {
+		response, err := http.DefaultClient.Do(req)
+		c.Assert(err, checker.IsNil)
+		c.Assert(response.StatusCode, checker.Equals, http.StatusOK)
+	}
+
+	countTotal = atomic.LoadInt32(&count)
+	val1 = atomic.LoadInt32(&countMirror1)
+	val2 = atomic.LoadInt32(&countMirror2)
+
+	c.Assert(countTotal, checker.Equals, int32(10))
+	c.Assert(val1, checker.Equals, int32(1))
+	c.Assert(val2, checker.Equals, int32(5))
+
+	atomic.StoreInt32(&count, 0)
+	atomic.StoreInt32(&countMirror1, 0)
+	atomic.StoreInt32(&countMirror2, 0)
+
+	req, err = http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/whoamiWithMaxBody", bytes.NewBuffer(body20))
+	req.Header.Set("Size", "20")
+	c.Assert(err, checker.IsNil)
+	for i := 0; i < 10; i++ {
+		response, err := http.DefaultClient.Do(req)
+		c.Assert(err, checker.IsNil)
+		c.Assert(response.StatusCode, checker.Equals, http.StatusOK)
+	}
+
+	countTotal = atomic.LoadInt32(&count)
+	val1 = atomic.LoadInt32(&countMirror1)
+	val2 = atomic.LoadInt32(&countMirror2)
+
+	c.Assert(countTotal, checker.Equals, int32(10))
+	c.Assert(val1, checker.Equals, int32(0))
+	c.Assert(val2, checker.Equals, int32(0))
+}
+
+func (s *SimpleSuite) TestMirrorCanceled(c *check.C) {
+	var count, countMirror1, countMirror2 int32
+
+	main := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		atomic.AddInt32(&count, 1)
+		time.Sleep(2 * time.Second)
+	}))
+
+	mirror1 := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		atomic.AddInt32(&countMirror1, 1)
+	}))
+
+	mirror2 := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		atomic.AddInt32(&countMirror2, 1)
+	}))
+
+	mainServer := main.URL
+	mirror1Server := mirror1.URL
+	mirror2Server := mirror2.URL
+
+	file := s.adaptFile(c, "fixtures/mirror.toml", struct {
+		MainServer    string
+		Mirror1Server string
+		Mirror2Server string
+	}{MainServer: mainServer, Mirror1Server: mirror1Server, Mirror2Server: mirror2Server})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/http/services", 1000*time.Millisecond, try.BodyContains("mirror1", "mirror2", "service1"))
+	c.Assert(err, checker.IsNil)
+
+	for i := 0; i < 5; i++ {
+		req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8000/whoami", nil)
+		c.Assert(err, checker.IsNil)
+
+		client := &http.Client{
+			Timeout: time.Second,
+		}
+		_, _ = client.Do(req)
+	}
+
+	countTotal := atomic.LoadInt32(&count)
+	val1 := atomic.LoadInt32(&countMirror1)
+	val2 := atomic.LoadInt32(&countMirror2)
+
+	c.Assert(countTotal, checker.Equals, int32(5))
+	c.Assert(val1, checker.Equals, int32(0))
+	c.Assert(val2, checker.Equals, int32(0))
+}
+
+func (s *SimpleSuite) TestSecureAPI(c *check.C) {
+	s.createComposeProject(c, "base")
+	s.composeProject.Start(c)
+
+	file := s.adaptFile(c, "./fixtures/simple_secure_api.toml", struct{}{})
+	defer os.Remove(file)
+
+	cmd, output := s.traefikCmd(withConfigFile(file))
+	defer output(c)
+
+	err := cmd.Start()
+	c.Assert(err, checker.IsNil)
+	defer cmd.Process.Kill()
+
+	err = try.GetRequest("http://127.0.0.1:8000/secure/api/rawdata", 1*time.Second, try.StatusCodeIs(http.StatusOK))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/api/rawdata", 1*time.Second, try.StatusCodeIs(http.StatusNotFound))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 1*time.Second, try.StatusCodeIs(http.StatusNotFound))
+	c.Assert(err, checker.IsNil)
+}
+
+func (s *SimpleSuite) TestContentTypeDisableAutoDetect(c *check.C) {
+	srv1 := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header()["Content-Type"] = nil
+		switch req.URL.Path[:4] {
+		case "/css":
+			if !strings.Contains(req.URL.Path, "noct") {
+				rw.Header().Set("Content-Type", "text/css")
+			}
+
+			rw.WriteHeader(http.StatusOK)
+
+			_, err := rw.Write([]byte(".testcss { }"))
+			c.Assert(err, checker.IsNil)
+		case "/pdf":
+			if !strings.Contains(req.URL.Path, "noct") {
+				rw.Header().Set("Content-Type", "application/pdf")
+			}
+
+			rw.WriteHeader(http.StatusOK)
+
+			bytes, err := ioutil.ReadFile("fixtures/test.pdf")
+			c.Assert(err, checker.IsNil)
+
+			_, err = rw.Write(bytes)
+			c.Assert(err, checker.IsNil)
+		}
+	}))
+
+	defer srv1.Close()
+
+	file := s.adaptFile(c, "fixtures/simple_contenttype.toml", struct {
+		Server string
+	}{
+		Server: srv1.URL,
+	})
+	defer os.Remove(file)
+
+	cmd, display := s.traefikCmd(withConfigFile(file), "--log.level=DEBUG")
+	defer display(c)
+
+	err := cmd.Start()
+	c.Assert(err, check.IsNil)
+	defer cmd.Process.Kill()
+
+	// wait for traefik
+	err = try.GetRequest("http://127.0.0.1:8080/api/rawdata", 10*time.Second, try.BodyContains("127.0.0.1"))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/css/ct/nomiddleware", time.Second, try.HasHeaderValue("Content-Type", "text/css", false))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/pdf/ct/nomiddleware", time.Second, try.HasHeaderValue("Content-Type", "application/pdf", false))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/css/ct/middlewareauto", time.Second, try.HasHeaderValue("Content-Type", "text/css", false))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/pdf/ct/nomiddlewareauto", time.Second, try.HasHeaderValue("Content-Type", "application/pdf", false))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/css/ct/middlewarenoauto", time.Second, try.HasHeaderValue("Content-Type", "text/css", false))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/pdf/ct/nomiddlewarenoauto", time.Second, try.HasHeaderValue("Content-Type", "application/pdf", false))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/css/noct/nomiddleware", time.Second, try.HasHeaderValue("Content-Type", "text/plain; charset=utf-8", false))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/pdf/noct/nomiddleware", time.Second, try.HasHeaderValue("Content-Type", "application/pdf", false))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/css/noct/middlewareauto", time.Second, try.HasHeaderValue("Content-Type", "text/plain; charset=utf-8", false))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/pdf/noct/nomiddlewareauto", time.Second, try.HasHeaderValue("Content-Type", "application/pdf", false))
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/css/noct/middlewarenoauto", time.Second, func(res *http.Response) error {
+		if ct, ok := res.Header["Content-Type"]; ok {
+			return fmt.Errorf("should have no content type and %s is present", ct)
+		}
+		return nil
+	})
+	c.Assert(err, checker.IsNil)
+
+	err = try.GetRequest("http://127.0.0.1:8000/pdf/noct/middlewarenoauto", time.Second, func(res *http.Response) error {
+		if ct, ok := res.Header["Content-Type"]; ok {
+			return fmt.Errorf("should have no content type and %s is present", ct)
+		}
+		return nil
+	})
+	c.Assert(err, checker.IsNil)
 }

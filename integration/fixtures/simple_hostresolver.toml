@@ -1,17 +1,22 @@
+[global]
+  checkNewVersion = false
+  sendAnonymousUsage = false
+
 [log]
-logLevel = "DEBUG"
+  level = "DEBUG"
 
 [entryPoints]
-  [entryPoints.http]
-  address = ":8000"
+  [entryPoints.web]
+    address = ":8000"
 
 [api]
+  insecure = true
 
 [providers]
-   [providers.docker]
-      exposedByDefault = false
-      domain = "docker.local"
-      watch = true
+  [providers.docker]
+    exposedByDefault = false
+    defaultRule = "Host(`{{ normalize .Name }}.docker.local`)"
+    watch = true
 
 [hostResolver]
-cnameFlattening = true
+  cnameFlattening = true

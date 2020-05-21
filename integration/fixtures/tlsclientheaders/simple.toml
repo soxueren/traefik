@@ -1,29 +1,35 @@
-[log]
-logLevel = "DEBUG"
-
 [global]
-debug = true
+  checkNewVersion = false
+  sendAnonymousUsage = false
+
+[log]
+  level = "DEBUG"
 
 [serversTransport]
-rootCAs = [ """{{ .RootCertContent }}""" ]
+  rootCAs = [ """{{ .RootCertContent }}""" ]
 
 [entryPoints]
-  [entryPoints.https]
+  [entryPoints.websecure]
     address = ":8443"
 
-    [entryPoints.https.tls]
-
-      [entryPoints.https.tls.ClientCA]
-      files = [ """{{ .RootCertContent }}""" ]
-      optional = false
-
-      [entryPoints.https.tls.DefaultCertificate]
-      certFile = """{{ .ServerCertContent }}"""
-      keyFile  = """{{ .ServerKeyContent }}"""
-
 [api]
+  insecure = true
 
 [providers]
-   [providers.docker]
-      endpoint = "unix:///var/run/docker.sock"
-      watch = true
+  [providers.docker]
+    watch = true
+
+  [providers.file]
+    filename = "{{ .SelfFilename }}"
+
+## dynamic configuration ##
+
+[tls.options]
+  [tls.options.default.clientAuth]
+    caFiles = [ """{{ .RootCertContent }}""" ]
+    clientAuthType = "RequireAndVerifyClientCert"
+
+[tls.stores]
+  [tls.stores.default.defaultCertificate]
+    certFile = """{{ .ServerCertContent }}"""
+    keyFile  = """{{ .ServerKeyContent }}"""
